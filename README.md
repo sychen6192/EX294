@@ -941,7 +941,7 @@ You are at {{ ansible_facts['fqdn'] }} on {{ ansible_facts['default_ipv4']['addr
 ```
 :::
 
-### 使用 requirements 安裝role
+### 使用 requirements.yml 安裝role
 ```
 /home/student/ansible/roles/requirements.yml,
 下載並安裝 roles 到 /home/student/ansible/roles
@@ -954,6 +954,386 @@ http://content.example.com/pub/phpinfo.tar
 ```
 ::: spoiler reference
 ```yaml=
+---
+# file單數 兩條// r+ 路徑
 
+- src: file:///home/student/haproxy.tar
+  name: nb
+
+- src: file:///home/student/phpinfo.tar
+  name: pi
+  
+```
+```bash=
+ansible-galaxy role install -p ./roles -r ./roles/requirements.yml
+```
+:::
+
+### 使用 Ansible Galaxy 的 role 
+> 要看一下設定
+::: spoiler reference
+```yaml=
+---
+- name: ensure directory existed
+  hosts: webservers
+  tasks:
+    - name: directory
+      ansible.builtin.file:
+        path: /var/www/html
+        state: directory
+
+- name: gather fact
+  hosts: webservers
+  become: true
+  roles:
+    - pi
+
+- name: haproxy
+  hosts: balancer
+  remote_user: devops
+  become: true
+  roles:
+    - nb
+  tasks:
+    - name: server1
+      ansible.posix.firewalld:
+        service: http
+        permanent: true
+        immediate: true
+        state: enabled
+```
+:::
+### 建立 web 站台目錄
+```
+建立 playbook /home/student/ansible/createwebdir.yml:
+執行在 production 群組裡的主機
+建立 /webapp 目錄
+目錄擁有群組為 webapp
+權限設定為: owner=read+write+execute, group=read+write+execute, other=read+execute
+特殊權限: set group ID
+建立 Symbolically link /var/www/html/webapp 指向 /webapp
+建立檔案 /webapp/index.html 內容為: Production Test
+瀏覽時 (http://serverc.lab.example.com/webapp/) 要能看到以下的輸出:
+
+Production Test 
+```
+
+::: spoiler reference
+```yaml=
+---
+
+- name: easy create folder
+  hosts: production
+  become: true
+  tasks:
+    - name: conf selinux
+      community.general.sefcontext:
+        target: '/webapp(/.*)?'
+        setype: httpd_sys_content_t
+        state: present
+
+    - name: create group
+      ansible.builtin.group:
+        name: webapp
+        state: present
+
+    - name: create
+      ansible.builtin.file:
+        path: /webapp
+        state: directory
+        group: webapp # owner?
+        mode: '2775' # checkuid
+        setype: httpd_sys_content_t # important
+
+    - name: symbolic
+      ansible.builtin.file:
+        src: /webapp
+        dest: /var/www/html/webapp
+        state: link
+
+    - name: file
+      ansible.builtin.copy:
+        dest: /webapp/index.html
+        content: Production Test
+        setype: httpd_sys_content_t # important
+```
+> selinux開一下比較好
+:::
+
+### 建立及使用 LV 
+```
+建立 playbook  /home/student/ansible/disk1.yml 執行在所有主機:
+建立 logical volume:
+logical volume 建立在 fox volume group
+logical volume 命名為 avatar
+logical volume 大小為 800 MiB
+
+在 logical volume 上建立 xfs 檔案系統
+
+如果無法建立指定大小的 logical volume, 要出現錯誤訊息:
+Could not create logical volume of that size
+而且能夠建立 500 MiB 大小的 logical volume
+
+如果 volume group fox 不存在, 要出現錯誤訊息:
+Volume group does not exist
+```
+::: spoiler reference
+```yaml=
+---
+
+- name: create lv
+  hosts: all
+  become: true
+  tasks:
+    - name: fox is existed
+      ansible.builtin.fail:
+        msg: Volume group does not exist
+      when: ansible_facts["lvm"]["vgs"]["fox"] is not defined
+    
+    - name: create lv block
+      block:
+        - name: Creates a logical volume
+          community.general.lvol:
+            vg: fox
+            size: 800
+            lv: avartar
+          notify: create fs
+
+      rescue:
+        - name: not enough
+          ansible.builtin.debug:
+            msg: Could not create logical volume of that size
+           
+        - name: 500g
+          community.general.lvol:
+            vg: fox
+            size: 500g
+            lv: avartar
+          notify: create fs
+
+  handlers:
+    - name: create fs
+      community.general.filesystem:
+        fstype: xfs
+        dev: /dev/fox/avartar
+```
+:::
+
+### 建立及使用 Partition
+```
+建立 playbook  /home/student/ansible/part1.yml 執行在 balancer 主機:
+在 vdc 建立1號 partition:
+partition 大小為 1500 MiB
+在 partition 上建立 ext4 檔案系統
+檔案系統要固定掛載在 /space1
+
+在 vdd 建立1號 partition:
+partition 大小為 1500 MiB
+在 partition 上建立 ext4 檔案系統
+檔案系統要固定掛載在 /space2
+
+如果無法建立指定大小的 partition , 要出現錯誤訊息:
+Could not create partition of that size
+而且能夠建立 800 MiB 大小的 partition
+
+如果 disk 不存在, 要出現錯誤訊息:
+Disk does not exist
+```
+
+::: spoiler reference
+```yaml=
+---
+- name: Create partition and Filesyste
+  hosts: balancer
+  become: true
+  tasks:
+    - name: no vdc
+      ansible.builtin.fail:
+        msg: Disk does not exist
+      when: ansible_facts['devices']['vdc'] is not defined
+
+    - name: create partition1
+      block:
+        - name: partition 1500m
+          community.general.parted:
+            device: /dev/vdc
+            number: 1
+            state: present
+            part_start: 1MiB
+            part_end: 1501MiB
+          notify: 
+            - create fs vdc
+            - mount fs vdc
+      rescue:
+        - name: send  message
+          ansible.builtin.debug:
+            msg: Could not create partition of that size
+
+        - name: partition 800m
+          community.general.parted:
+            device: /dev/vdc
+            number: 1
+            state: present
+            part_start: 1MiB
+            part_end: 801MiB
+          notify: 
+            - create fs vdc
+            - mount fs vdc
+
+    - name: no vdd
+      ansible.builtin.fail:
+        msg: Disk does not exist
+      when: ansible_facts['devices']['vdd'] is not defined
+
+    - name: create partition1
+      block:
+        - name: partition 1500m
+          community.general.parted:
+            device: /dev/vdd
+            number: 1
+            state: present
+            part_start: 1MiB
+            part_end: 1501MiB
+          notify:
+            - create fs vdd
+            - mount fs vdd
+      rescue:
+        - name: send  message
+          ansible.builtin.debug:
+            msg: Could not create partition of that size
+
+        - name: partition 800m
+          community.general.parted:
+            device: /dev/vdd
+            number: 1
+            state: present
+            part_start: 1MiB
+            part_end: 801MiB
+          notify:
+            - create fs vdd
+            - mount fs vdd
+
+  handlers:
+    - name: create fs vdc
+      community.general.filesystem:
+        fstype: ext4
+        dev: /dev/vdc1
+
+    - name: mount fs vdc
+      ansible.posix.mount:
+        path: /space1
+        src: /dev/vdc1
+        state: mounted
+        fstype: ext4
+
+    - name: create fs vdd
+      community.general.filesystem:
+        fstype: ext4
+        dev: /dev/vdd1
+
+    - name: mount fs vdd
+      ansible.posix.mount:
+        path: /space2
+        src: /dev/vdd1
+        state: mounted
+        fstype: ext4
+
+```
+:::
+
+### 建立使用者帳號
+```
+使用者的 job description 若是 developer:
+建立在 developer 和 test 群組裡的 managed hosts
+UID 依照 user_list.yml 檔案裡的內容設定
+密碼設定為 pw_developer 變數的值(vault.yml),  設定密碼的有效天數為 99 天
+帳號的 secondary group 設定為 developers
+密碼要使用 SHA512 hash 格式
+
+使用者的 job description 若是 manager:
+建立在 production 群組裡的 managed hosts
+UID 依照 user_list.yml 檔案裡的內容設定
+密碼設定為 pw_manager 變數的值(vault.yml),  設定密碼的有效天數為 99 天 -> password_expire_max
+帳號的 secondary group 設定為 manager -> groups
+密碼要使用 SHA512 hash 格式 -> password_hash('sha512')
+
+playbook 要能使用 vault password file /home/student/ansible/vault-password.txt 運作
+```
+::: spoiler reference
+```yaml=
+---
+
+- name: create user
+  hosts: production, test
+  become: true
+  vars_files:
+    - user_list.yml
+    - vault.yml
+
+  tasks:
+    - name: add group
+      ansible.builtin.group:
+        name: developers
+        state: present
+
+    - name: create user
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        groups: developers
+        uid: "{{ item.uid }}"
+        password: "{{ pw_developer | password_hash('sha512') }}"
+        state: present
+        password_expire_max: 99
+      loop: "{{ users }}"
+      when: item.job == "developer"
+
+
+- name: create user
+  hosts: production
+  become: true
+  vars_files:
+    - user_list.yml
+    - vault.yml
+
+  tasks:
+    - name: add group
+      ansible.builtin.group:
+        name: manager
+        state: present
+
+    - name: create user
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        groups: manager
+        uid: "{{ item.uid }}"
+        password: "{{ pw_manager | password_hash('sha512') }}"
+        state: present
+        password_expire_max: 99
+      loop: "{{ users }}"
+      when: item.job == "manager"
+```
+> 題目有要求要用vault_password_file解鎖
+> 那就必須要把密碼echo進去
+:::
+
+### cron job
+```
+使用者 devops 設定了 cron job 每 2 分鐘執行以下指令:
+logger "EX294 is so easy."
+```
+::: spoiler reference
+```yaml=
+---
+
+- name: cronjob
+  hosts: all
+  become: true
+  tasks:
+    - name: file
+      ansible.builtin.cron:
+        name: cron
+        minute: "*/2"
+        user: devops
+        job: 'logger "EX294 is so easy."'
 ```
 :::
